@@ -11,11 +11,12 @@ library(shiny)
 library(DT)
 library(httr)
 library(readr)
+library(jsonlite)
 # Define UI for data upload app ----
 ui <- fluidPage(
   
   # App title ----
-  titlePanel("Uploading Files"),
+  titlePanel("Data Upload/Entry"),
   
   # Sidebar layout with input and output definitions ----
   sidebarLayout(
@@ -83,134 +84,135 @@ ui <- fluidPage(
 )
 
 # Define server logic to read selected file ----
-server <- function(input, output) {
-  
+
+  # GDD reactive
+  server <- function(input, output) {
+
+  parse_date <- function(x) {
+    as.Date(x, tryFormats = c("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"))
+  }
+
   data <- reactiveVal(data.frame(
     Date = character(),
     AvgPlateMeterReading = numeric()
   ))
-  
+
   observeEvent(input$delete_rows, {
     req(input$contents_rows_selected)
-    
+
     df <- data()
-    
-    # remove selected rows
     df <- df[-input$contents_rows_selected, ]
-    
     data(df)
   })
-  
-  # GDD reactive
-  gdd_data <- reactive({
-    req(data())
-    
-    df <- data()
-    
-    start_date <- min(as.Date(df$Date), na.rm = TRUE)
-    end_date   <- max(as.Date(df$Date), na.rm = TRUE)
-    
-    dates <- seq(start_date, end_date, by = "day")
-    
-    all_data <- lapply(dates, function(d) {
-      url <- paste0(
-        "https://www.mesonet.org/data/public/mesonet/mts/STIL/",
-        format(d, "%m/%d/%Y"),
-        ".mts"
-      )
-      
-      tryCatch({
-        read_table(url, col_names = FALSE, skip = 2)
-      }, error = function(e) NULL)
-    })
-    
-    all_data <- do.call(rbind, all_data)
-    if (is.null(all_data)) return(NULL)
-    
-    colnames(all_data)[c(1, 9, 10)] <- c("DateTime", "Tmax", "Tmin")
-    
-    all_data$Date <- as.Date(substr(all_data$DateTime, 1, 8), "%Y%m%d")
-    
-    daily <- aggregate(cbind(Tmax, Tmin) ~ Date, data = all_data, FUN = mean)
-    
-    daily$GDD <- pmax(((daily$Tmax + daily$Tmin)/2) - 32, 0)
-    daily$GDD_cum <- cumsum(daily$GDD)
-    
-    daily
-  })
-  
-  # manual entry
+
   observeEvent(input$add_row, {
     df <- data()
-    
+
     new_row <- data.frame(
       Date = input$Date,
       AvgPlateMeterReading = input$AvgPlateMeterReading
     )
-    
+
     data(rbind(df, new_row))
   })
-  
-  # file upload
+
   observeEvent(input$file1, {
     req(input$file1)
-    
+
     df_list <- lapply(input$file1$datapath, function(path) {
       read.csv(path,
                header = input$header,
                sep = input$sep,
                quote = input$quote)
     })
-    
+
     data(do.call(rbind, df_list))
   })
-  
-  # table
-  output$contents <- renderDT({
+
+  gdd_data <- reactive({
+    
     req(data())
     
     df <- data()
-    df$Date <- as.Date(df$Date, tryFormats = c(
-      "%Y-%m-%d",
-      "%m/%d/%Y",
-      "%m/%d/%y"
-    ))
+    df$Date <- parse_date(df$Date)
+    df <- df[!is.na(df$Date), ]
     
+    req(nrow(df) > 0)
+    
+    start_date <- min(df$Date)
+    end_date   <- max(df$Date)
+    
+    year <- format(start_date, "%Y")
+    
+    url <- paste0(
+      "https://mesonet.org/data/public/mesonet/mts/",
+      year, "/",
+      year, "mesonet.txt"
+    )
+    raw <- tryCatch({
+      read.table(url, header = TRUE)
+    }, error = function(e) {
+      message("Download error: ", e$message)
+      return(NULL)
+    })
+    
+    if (is.null(raw)) return(NULL)
+    
+    # Filter for station STIL (Stillwater)
+    raw <- raw[raw$STID == "STIL", ]
+    
+    # Convert date
+    raw$Date <- as.Date(raw$YYYYMMDD, format = "%Y%m%d")
+    
+    # Filter to your date range
+    raw <- raw[raw$Date >= start_date & raw$Date <= end_date, ]
+    
+    if (nrow(raw) == 0) return(NULL)
+    
+    # Use TMAX and TMIN directly
+    raw$GDD <- pmax(((raw$TMAX + raw$TMIN) / 2) - 32, 0)
+    raw$GDD_cum <- cumsum(raw$GDD)
+    
+    raw[, c("Date", "GDD", "GDD_cum")]
+  })
+  output$contents <- renderDT({
+
+    req(data())
+
+    df <- data()
+    df$Date <- parse_date(df$Date)
+
     df$ForageMass_kg_ha <- (df$AvgPlateMeterReading * 140) + 500
-    
+
     gdd <- gdd_data()
-    
+
     if (!is.null(gdd)) {
-      df <- merge(df, gdd[, c("Date", "GDD", "GDD_cum")], by = "Date", all.x = TRUE)
+      df <- merge(df, gdd[, c("Date", "GDD", "GDD_cum")],
+                  by = "Date", all.x = TRUE)
     }
-    
+
     datatable(df, editable = TRUE, selection = "multiple")
   })
-  
-  # edits
+
   observeEvent(input$contents_cell_edit, {
     info <- input$contents_cell_edit
     df <- data()
-    
+
     df[info$row, info$col] <- info$value
     data(df)
   })
-  
-  # plot 1: Date vs Forage
+
   output$plot1 <- renderPlot({
+
     req(data())
-    
+
     df <- data()
-    df$Date <- as.Date(df$Date, tryFormats = c(
-      "%Y-%m-%d",
-      "%m/%d/%Y",
-      "%m/%d/%y"
-      ))
-    
+    df$Date <- parse_date(df$Date)
+
     df$ForageMass_kg_ha <- (df$AvgPlateMeterReading * 140) + 500
-    
+
     df <- df[order(df$Date), ]
-    
+
     plot(df$Date,
          df$ForageMass_kg_ha,
          type = "l",
@@ -220,27 +222,24 @@ server <- function(input, output) {
          ylab = "Forage Mass (kg/ha)",
          main = "Forage Mass Over Time")
   })
-  
-  # plot 2: GDD vs Forage
+
   output$plot2 <- renderPlot({
+
     req(data())
-    
+
     df <- data()
-    df$Date <- as.Date(df$Date, tryFormats = c(
-      "%Y-%m-%d",
-      "%m/%d/%Y",
-      "%m/%d/%y"
-      ))
-    
+    df$Date <- parse_date(df$Date)
+
     df$ForageMass_kg_ha <- (df$AvgPlateMeterReading * 140) + 500
-    
+
     gdd <- gdd_data()
     req(gdd)
-    
-    df <- merge(df, gdd[, c("Date", "GDD_cum")], by = "Date", all.x = TRUE)
-    
+
+    df <- merge(df, gdd[, c("Date", "GDD_cum")],
+                by = "Date", all.x = TRUE)
+
     df <- df[order(df$GDD_cum), ]
-    
+
     plot(df$GDD_cum,
          df$ForageMass_kg_ha,
          type = "b",
@@ -251,6 +250,5 @@ server <- function(input, output) {
          main = "Forage Mass vs Growing Degree Days")
   })
 }
-
 # Create Shiny app ----
 shinyApp(ui, server)
