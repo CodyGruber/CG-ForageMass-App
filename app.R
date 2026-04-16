@@ -1,6 +1,9 @@
 library(shiny)
+library(httr)
+library(jsonlite)
 library(DT)
 library(mesonet)
+library(tidyverse)
 # Use mesonet package if available, otherwise fall back to IEM API
 has_mesonet_pkg <- requireNamespace("mesonet", quietly = TRUE)
 
@@ -100,8 +103,8 @@ server <- function(input, output, session) {
       "&format=csv"
     )
     tryCatch({
-      raw <- read.csv(url, na.strings = c("", "M", "T", "None"))
-      if (nrow(raw) == 0) return(NULL)
+      raw <- dplyr::tibble(read.csv(url, na.strings = c("", "M", "T", "None")),
+      if (nrow(raw) == 0) return(NULL))
       # IEM daily.py returns columns: station, day, max_tmpf, min_tmpf
       raw$Date <- as.Date(raw$day)
       raw$TMAX  <- as.numeric(raw$max_tmpf)
@@ -115,19 +118,53 @@ server <- function(input, output, session) {
   
   fetch_mesonet_pkg <- function(start_date, end_date) {
     tryCatch({
+      
       raw <- mesonet::mnet_retrieve(
-        stid       = "STIL",
+        stid = "STIL",
         start_date = format(start_date, "%Y-%m-%d"),
-        end_date   = format(end_date,   "%Y-%m-%d")
+        end_date = format(end_date, "%Y-%m-%d")
       )
-      daily <- mesonet::mnet_summarize(raw)
-      daily$Date <- as.Date(daily$DATE)
-      # mnet_summarize gives TAIR_MAX / TAIR_MIN in °C — convert to °F
-      daily$TMAX <- daily$TAIR_MAX * 9/5 + 32
-      daily$TMIN <- daily$TAIR_MIN * 9/5 + 32
-      daily[, c("Date","TMAX","TMIN")]
+      
+      daily <- mesonet::mnet_summarize(
+        sub_daily = raw,
+        tz = "Etc/GMT+6",
+        interval = "1 day",
+        include_qc_variables = FALSE
+      )
+      
+      # 🔥 DEBUG (keep this once while testing)
+      print(names(daily))
+      
+      # ---- FIX 1: detect date column safely ----
+      date_col <- grep("date", names(daily), ignore.case = TRUE, value = TRUE)[1]
+      if (is.na(date_col)) stop("No date column found in mesonet output")
+      
+      daily$Date <- as.Date(daily[[date_col]])
+      
+      # ---- FIX 2: detect temp columns safely ----
+      tmax_col <- grep("max", names(daily), ignore.case = TRUE, value = TRUE)[1]
+      tmin_col <- grep("min", names(daily), ignore.case = TRUE, value = TRUE)[1]
+      
+      if (is.na(tmax_col) || is.na(tmin_col)) {
+        stop("Temperature columns not found in mesonet output")
+      }
+      
+      # ---- FIX 3: convert safely ----
+      daily$TMAX <- as.numeric(daily[[tmax_col]]) * 9/5 + 32
+      daily$TMIN <- as.numeric(daily[[tmin_col]]) * 9/5 + 32
+      
+      # ---- FIX 4: prevent silent row loss ----
+      daily <- daily[!is.na(daily$TMAX) & !is.na(daily$TMIN), ]
+      
+      if (nrow(daily) == 0) {
+        stop("All rows removed after NA filtering — check column mapping")
+      }
+      
+      daily[, c("Date", "TMAX", "TMIN")]
+      
     }, error = function(e) {
-      message("mesonet pkg error: ", e$message); NULL
+      message("mesonet pkg error: ", e$message)
+      NULL
     })
   }
   
