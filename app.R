@@ -46,6 +46,54 @@ ui <- fluidPage(
   )
 )
 
+get_nws_forecast <- function(lat = 36.1156, lon = -97.0584) {
+  
+  # Step 1: get forecast URL from gridpoint API
+  point_url <- paste0(
+    "https://api.weather.gov/points/",
+    lat, ",", lon
+  )
+  
+  res <- httr::GET(point_url, user_agent("shiny-app"))
+  stop_for_status(res)
+  
+  point_data <- jsonlite::fromJSON(httr::content(res, "text", encoding = "UTF-8"))
+  
+  forecast_url <- point_data$properties$forecast
+  
+  # Step 2: pull forecast
+  forecast_res <- httr::GET(forecast_url, user_agent("shiny-app"))
+  stop_for_status(forecast_res)
+  
+  forecast_json <- jsonlite::fromJSON(
+    httr::content(forecast_res, "text", encoding = "UTF-8"),
+    simplifyVector = TRUE
+  )
+  
+  periods <- forecast_json$properties$periods
+  
+  # Step 3: extract relevant fields
+  df <- data.frame(
+    name = periods$name,
+    startTime = as.POSIXct(periods$startTime, tz = "UTC"),
+    temp = periods$temperature,
+    wind = periods$windSpeed,
+    forecast = periods$detailedForecast,
+    stringsAsFactors = FALSE
+  )
+  
+  # Step 4: split into daily max/min approximation
+  df$date <- as.Date(df$startTime)
+  
+  # NWS alternates day/night periods → approximate daily max/min
+  daily <- aggregate(temp ~ date, df, function(x) c(max = max(x), min = min(x)))
+  
+  daily <- do.call(data.frame, daily)
+  names(daily) <- c("Date", "TMAX", "TMIN")
+  
+  return(daily)
+}
+
 # ── SERVER ────────────────────────────────────────────────────────────────────
 server <- function(input, output, session) {
   
@@ -259,68 +307,84 @@ server <- function(input, output, session) {
   
   # ── Plot 3: 10-day forecast ──────────────────────────────────────────────
   output$plot3 <- renderPlot({
+    
     req(data())
-    df                  <- data()
-    df$Date             <- parse_date(df$Date)
+    
+    df <- data()
+    df$Date <- parse_date(df$Date)
     df$ForageMass_kg_ha <- (df$AvgPlateMeterReading * 140) + 500
+    
     gdd <- gdd_data()
     req(gdd)
     
     obs <- merge(df, gdd[, c("Date","GDD_cum")], by = "Date", all.x = TRUE)
-    obs <- obs[!is.na(obs$GDD_cum) & !is.na(obs$ForageMass_kg_ha), ]
+    obs <- obs[complete.cases(obs[, c("Date","GDD_cum","ForageMass_kg_ha")]), ]
+    
     req(nrow(obs) >= 2)
     
-    last_date   <- max(obs$Date)
-    future_gdd  <- gdd[gdd$Date > last_date, ]
+    # ---- Fit model
+    fit <- lm(ForageMass_kg_ha ~ GDD_cum, data = obs)
+    a <- coef(fit)[1]
+    b <- coef(fit)[2]
     
-    # Fit linear model: ForageMass ~ GDD_cum (add log transform option)
-    fit <- tryCatch(
-      lm(ForageMass_kg_ha ~ GDD_cum, data = obs),
-      error = function(e) NULL
-    )
-    req(!is.null(fit))
+    # ---- NOAA forecast
+    forecast_weather <- tryCatch({
+      get_nws_forecast()
+    }, error = function(e) NULL)
     
-    all_gdd  <- c(obs$GDD_cum, future_gdd$GDD_cum)
-    pred_df  <- data.frame(GDD_cum = all_gdd)
-    pred_df$ForageMass_pred <- predict(fit, newdata = pred_df)
-    
-    n_obs   <- nrow(obs)
-    xlim    <- range(all_gdd, na.rm = TRUE)
-    ylim    <- range(c(obs$ForageMass_kg_ha, pred_df$ForageMass_pred), na.rm = TRUE)
-    
-    plot(obs$GDD_cum, obs$ForageMass_kg_ha,
-         pch = 16, col = "blue",
-         xlim = xlim, ylim = ylim,
-         xlab = "Cumulative GDD (base 32°F)",
-         ylab = "Forage Mass (kg DM/ha)",
-         main = "10-Day Forage Mass Forecast")
-    
-    # Full fitted + forecast line
-    ord <- order(pred_df$GDD_cum)
-    lines(pred_df$GDD_cum[ord], pred_df$ForageMass_pred[ord],
-          col = "gray40", lty = 2, lwd = 1.5)
-    
-    # Highlight forecast portion
-    if (nrow(future_gdd) > 0) {
-      fut_pred <- predict(fit, newdata = data.frame(GDD_cum = future_gdd$GDD_cum))
-      lines(future_gdd$GDD_cum, fut_pred, col = "red", lwd = 2)
-      points(future_gdd$GDD_cum, fut_pred, pch = 17, col = "red", cex = 0.9)
-      
-      # Annotate last forecast point
-      last_i <- which.max(future_gdd$GDD_cum)
-      text(future_gdd$GDD_cum[last_i], fut_pred[last_i],
-           labels = paste0(round(fut_pred[last_i]), " kg/ha\n",
-                           format(max(future_gdd$Date), "%b %d")),
-           pos = 3, col = "red", cex = 0.85)
+    if (is.null(forecast_weather) || nrow(forecast_weather) == 0) {
+      plot(obs$Date, obs$ForageMass_kg_ha,
+           pch = 16, col = "blue",
+           main = "NOAA Forecast Failed (Observed Only)",
+           xlab = "Date", ylab = "Forage Mass")
+      return()
     }
     
+    # ---- Remove NA temps (critical fix)
+    forecast_weather <- forecast_weather[
+      complete.cases(forecast_weather[, c("TMAX","TMIN")]),
+    ]
+    
+    if (nrow(forecast_weather) == 0) return()
+    
+    # ---- Compute forecast GDD correctly
+    forecast_weather$GDD <- pmax(
+      ((forecast_weather$TMAX + forecast_weather$TMIN)/2) - 32,
+      0
+    )
+    
+    # ---- FIX: safe cumulative baseline
+    last_gdd <- max(obs$GDD_cum, na.rm = TRUE)
+    if (is.infinite(last_gdd)) last_gdd <- 0
+    
+    forecast_weather$GDD_cum <- last_gdd + cumsum(forecast_weather$GDD)
+    
+    # ---- Predict forage
+    forecast_weather$Forage_pred <- predict(fit,
+                                            newdata = data.frame(
+                                              GDD_cum = forecast_weather$GDD_cum
+                                            ))
+    
+    # ---- Plot
+    plot(obs$Date, obs$ForageMass_kg_ha,
+         pch = 16, col = "blue",
+         xlab = "Date",
+         ylab = "Forage Mass (kg DM/ha)",
+         main = "10-Day Forage Forecast (NOAA NWS)")
+    
+    lines(forecast_weather$Date, forecast_weather$Forage_pred,
+          col = "red", lwd = 2)
+    
+    points(forecast_weather$Date, forecast_weather$Forage_pred,
+           col = "red", pch = 17)
+    
     legend("topleft",
-           legend = c("Observed", "Fitted", "Forecast (+10 days)"),
-           col    = c("blue", "gray40", "red"),
-           pch    = c(16, NA, 17),
-           lty    = c(NA, 2, 1),
-           lwd    = c(NA, 1.5, 2),
-           bty    = "n")
+           legend = c("Observed", "Forecast"),
+           col = c("blue", "red"),
+           pch = c(16, 17),
+           lty = c(NA, 1),
+           bty = "n")
+    
     grid()
   })
   
