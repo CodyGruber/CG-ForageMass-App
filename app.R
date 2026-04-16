@@ -1,255 +1,293 @@
-#
-# This is a Shiny web application. You can run the application by clicking
-# the 'Run App' button above.
-#
-# Find out more about building applications with Shiny here:
-#
-#    https://shiny.posit.co/
-#
-
 library(shiny)
 library(DT)
-library(httr)
-library(readr)
-library(jsonlite)
+library(mesonet)
+# Use mesonet package if available, otherwise fall back to IEM API
+has_mesonet_pkg <- requireNamespace("mesonet", quietly = TRUE)
 
-# Define UI for data upload app ----
+# ── UI ────────────────────────────────────────────────────────────────────────
 ui <- fluidPage(
+  titlePanel("Forage Mass Tracker & GDD Calibration"),
   
-  # App title ----
-  titlePanel("Data Upload/Entry"),
-  
-  # Sidebar layout with input and output definitions ----
   sidebarLayout(
-    
-    # Sidebar panel for inputs ----
     sidebarPanel(
+      h4("Manual Entry"),
+      textInput("Date", "Date (YYYY-MM-DD or MM/DD/YYYY)"),
+      numericInput("AvgPlateMeterReading", "Avg Plate Meter Reading", value = NA),
+      actionButton("add_row",    "Add Row",            class = "btn-primary"),
+      actionButton("delete_rows","Delete Selected Rows", class = "btn-danger"),
+      tags$hr(),
       
-      #manual input
-      textInput("Date", "Date"),
-      numericInput("AvgPlateMeterReading", "AvgPlateMeterReading", value = NA),
-      actionButton("add_row", "Add Row"),
-      
-      #deletebutton
-      actionButton("delete_rows", "Delete Selected Rows"),
-      
-      # Input: Select a file ----
+      h4("Upload CSV"),
       fileInput("file1", "Choose CSV File",
                 multiple = TRUE,
-                accept = c("text/csv",
-                           "text/comma-separated-values,text/plain",
-                           ".csv")),
-      
-      # Horizontal line ----
-      tags$hr(),
-      
-      # Input: Checkbox if file has header ----
+                accept   = c("text/csv","text/comma-separated-values,text/plain",".csv")),
       checkboxInput("header", "Header", TRUE),
-      
-      # Input: Select separator ----
-      radioButtons("sep", "Separator",
-                   choices = c(Comma = ",",
-                               Semicolon = ";",
-                               Tab = "\t"),
-                   selected = ","),
-      
-      # Input: Select quotes ----
+      radioButtons("sep",   "Separator",
+                   choices  = c(Comma=",", Semicolon=";", Tab="\t"), selected = ","),
       radioButtons("quote", "Quote",
-                   choices = c(None = "",
-                               "Double Quote" = '"',
-                               "Single Quote" = "'"),
+                   choices  = c(None="", "Double Quote"='"', "Single Quote"="'"),
                    selected = '"'),
-      
-      # Horizontal line ----
       tags$hr(),
-      
-      # Input: Select number of rows to display ----
-      radioButtons("disp", "Display",
-                   choices = c(Head = "head",
-                               All = "all"),
-                   selected = "head")
-      
+      radioButtons("disp","Display",
+                   choices  = c(Head="head", All="all"), selected = "head"),
+      tags$hr(),
+      verbatimTextOutput("gdd_status")
     ),
     
-    # Main panel for displaying outputs ----
     mainPanel(
-      
-      # Output: Data file ----
       DTOutput("contents"),
       plotOutput("plot1"),
-      plotOutput("plot2")
-      
+      plotOutput("plot2"),
+      plotOutput("plot3")   # NEW: forecast plot
     )
-    
   )
 )
 
-# Define server logic to read selected file ----
-
-  # GDD reactive
-  server <- function(input, output) {
-
+# ── SERVER ────────────────────────────────────────────────────────────────────
+server <- function(input, output, session) {
+  
   parse_date <- function(x) {
     as.Date(x, tryFormats = c("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"))
   }
-
+  
+  # ── Reactive data store ──────────────────────────────────────────────────
   data <- reactiveVal(data.frame(
-    Date = character(),
+    Date                 = character(),
     AvgPlateMeterReading = numeric()
   ))
-
+  
   observeEvent(input$delete_rows, {
     req(input$contents_rows_selected)
-
     df <- data()
     df <- df[-input$contents_rows_selected, ]
     data(df)
   })
-
+  
   observeEvent(input$add_row, {
-    df <- data()
-
-    new_row <- data.frame(
-      Date = input$Date,
-      AvgPlateMeterReading = input$AvgPlateMeterReading
-    )
-
-    data(rbind(df, new_row))
+    req(input$Date, input$AvgPlateMeterReading)
+    df  <- data()
+    new <- data.frame(Date = input$Date,
+                      AvgPlateMeterReading = input$AvgPlateMeterReading)
+    data(rbind(df, new))
   })
-
+  
   observeEvent(input$file1, {
     req(input$file1)
-
-    df_list <- lapply(input$file1$datapath, function(path) {
-      read.csv(path,
-               header = input$header,
-               sep = input$sep,
-               quote = input$quote)
+    df_list <- lapply(input$file1$datapath, function(p) {
+      read.csv(p, header = input$header, sep = input$sep, quote = input$quote)
     })
-
     data(do.call(rbind, df_list))
   })
-
-  gdd_data <- reactive({
-    
-    req(data())
-    
-    df <- data()
-    df$Date <- parse_date(df$Date)
-    df <- df[!is.na(df$Date), ]
-    
-    req(nrow(df) > 0)
-    
-    start_date <- min(df$Date)
-    end_date   <- max(df$Date)
-    
-    year <- format(start_date, "%Y")
-    
-    url <- paste0(
-      "https://mesonet.org/data/public/mesonet/mts/",
-      year, "/",
-      year, "mesonet.txt"
-    )
-    raw <- tryCatch({
-      read.table(url, header = TRUE)
-    }, error = function(e) {
-      message("Download error: ", e$message)
-      return(NULL)
-    })
-    
-    if (is.null(raw)) return(NULL)
-    
-    # Filter for station STIL (Stillwater)
-    raw <- raw[raw$STID == "STIL", ]
-    
-    # Convert date
-    raw$Date <- as.Date(raw$YYYYMMDD, format = "%Y%m%d")
-    
-    # Filter to your date range
-    raw <- raw[raw$Date >= start_date & raw$Date <= end_date, ]
-    
-    if (nrow(raw) == 0) return(NULL)
-    
-    # Use TMAX and TMIN directly
-    raw$GDD <- pmax(((raw$TMAX + raw$TMIN) / 2) - 32, 0)
-    raw$GDD_cum <- cumsum(raw$GDD)
-    
-    raw[, c("Date", "GDD", "GDD_cum")]
-  })
-  output$contents <- renderDT({
-
-    req(data())
-
-    df <- data()
-    df$Date <- parse_date(df$Date)
-
-    df$ForageMass_kg_ha <- (df$AvgPlateMeterReading * 140) + 500
-
-    gdd <- gdd_data()
-
-    if (!is.null(gdd)) {
-      df <- merge(df, gdd[, c("Date", "GDD", "GDD_cum")],
-                  by = "Date", all.x = TRUE)
-    }
-
-    datatable(df, editable = TRUE, selection = "multiple")
-  })
-
+  
   observeEvent(input$contents_cell_edit, {
     info <- input$contents_cell_edit
-    df <- data()
-
+    df   <- data()
     df[info$row, info$col] <- info$value
     data(df)
   })
-
-  output$plot1 <- renderPlot({
-
+  
+  # ── GDD fetch ────────────────────────────────────────────────────────────
+  gdd_status <- reactiveVal("No data loaded yet.")
+  
+  fetch_iem <- function(start_date, end_date) {
+    url <- paste0(
+      "https://mesonet.agron.iastate.edu/cgi-bin/request/daily.py?",
+      "network=OK_MESONET",
+      "&stations=STIL",
+      "&var=max_tmpf,min_tmpf",
+      "&sts=", format(start_date, "%Y-%m-%d"),
+      "&ets=", format(end_date,   "%Y-%m-%d"),
+      "&format=csv"
+    )
+    tryCatch({
+      raw <- read.csv(url, na.strings = c("", "M", "T", "None"))
+      if (nrow(raw) == 0) return(NULL)
+      # IEM daily.py returns columns: station, day, max_tmpf, min_tmpf
+      raw$Date <- as.Date(raw$day)
+      raw$TMAX  <- as.numeric(raw$max_tmpf)
+      raw$TMIN  <- as.numeric(raw$min_tmpf)
+      raw[, c("Date", "TMAX", "TMIN")]
+    }, error = function(e) {
+      message("IEM fetch error: ", e$message)
+      NULL
+    })
+  }
+  
+  fetch_mesonet_pkg <- function(start_date, end_date) {
+    tryCatch({
+      raw <- mesonet::mnet_retrieve(
+        stid       = "STIL",
+        start_date = format(start_date, "%Y-%m-%d"),
+        end_date   = format(end_date,   "%Y-%m-%d")
+      )
+      daily <- mesonet::mnet_summarize(raw)
+      daily$Date <- as.Date(daily$DATE)
+      # mnet_summarize gives TAIR_MAX / TAIR_MIN in °C — convert to °F
+      daily$TMAX <- daily$TAIR_MAX * 9/5 + 32
+      daily$TMIN <- daily$TAIR_MIN * 9/5 + 32
+      daily[, c("Date","TMAX","TMIN")]
+    }, error = function(e) {
+      message("mesonet pkg error: ", e$message); NULL
+    })
+  }
+  
+  gdd_data <- reactive({
     req(data())
-
-    df <- data()
-    df$Date <- parse_date(df$Date)
-
-    df$ForageMass_kg_ha <- (df$AvgPlateMeterReading * 140) + 500
-
-    df <- df[order(df$Date), ]
-
-    plot(df$Date,
-         df$ForageMass_kg_ha,
-         type = "l",
-         col = "darkgreen",
-         lwd = 2,
-         xlab = "Date",
-         ylab = "Forage Mass (kg/ha)",
-         main = "Forage Mass Over Time")
+    df         <- data()
+    df$Date    <- parse_date(df$Date)
+    df         <- df[!is.na(df$Date), ]
+    req(nrow(df) > 0)
+    
+    start_date <- min(df$Date)
+    # Extend 10 days past last entry for forecast window
+    end_date   <- max(df$Date) + 10
+    
+    gdd_status("Fetching weather data from Mesonet…")
+    
+    weather <- if (has_mesonet_pkg) {
+      fetch_mesonet_pkg(start_date, end_date)
+    } else {
+      fetch_iem(start_date, end_date)
+    }
+    
+    if (is.null(weather) || nrow(weather) == 0) {
+      gdd_status("⚠ Could not retrieve weather data. Check internet connection.")
+      return(NULL)
+    }
+    
+    weather <- weather[weather$Date >= start_date & weather$Date <= end_date, ]
+    weather <- weather[!is.na(weather$TMAX) & !is.na(weather$TMIN), ]
+    
+    if (nrow(weather) == 0) {
+      gdd_status("⚠ Weather data returned but no rows matched date range.")
+      return(NULL)
+    }
+    
+    weather <- weather[order(weather$Date), ]
+    weather$GDD     <- pmax(((weather$TMAX + weather$TMIN) / 2) - 32, 0)
+    weather$GDD_cum <- cumsum(weather$GDD)
+    
+    source_label <- if (has_mesonet_pkg) "mesonet pkg" else "IEM API"
+    gdd_status(paste0("✓ ", nrow(weather), " days of weather loaded via ", source_label,
+                      "\n  Period: ", format(min(weather$Date)), " – ",
+                      format(max(weather$Date))))
+    weather[, c("Date","GDD","GDD_cum")]
   })
-
-  output$plot2 <- renderPlot({
-
+  
+  # ── Table ────────────────────────────────────────────────────────────────
+  output$contents <- renderDT({
     req(data())
-
-    df <- data()
-    df$Date <- parse_date(df$Date)
-
+    df         <- data()
+    df$Date    <- parse_date(df$Date)
     df$ForageMass_kg_ha <- (df$AvgPlateMeterReading * 140) + 500
-
+    gdd <- gdd_data()
+    if (!is.null(gdd)) {
+      df <- merge(df, gdd[, c("Date","GDD","GDD_cum")], by = "Date", all.x = TRUE)
+    }
+    if (input$disp == "head") df <- head(df)
+    datatable(df, editable = TRUE, selection = "multiple")
+  })
+  
+  # ── Plot 1: Forage mass over time ────────────────────────────────────────
+  output$plot1 <- renderPlot({
+    req(data())
+    df                  <- data()
+    df$Date             <- parse_date(df$Date)
+    df$ForageMass_kg_ha <- (df$AvgPlateMeterReading * 140) + 500
+    df                  <- df[order(df$Date), ]
+    plot(df$Date, df$ForageMass_kg_ha,
+         type = "b", pch = 16, col = "darkgreen", lwd = 2,
+         xlab = "Date", ylab = "Forage Mass (kg DM/ha)",
+         main = "Forage Mass Over Time")
+    grid()
+  })
+  
+  # ── Plot 2: Forage mass vs cumulative GDD ───────────────────────────────
+  output$plot2 <- renderPlot({
+    req(data())
+    df                  <- data()
+    df$Date             <- parse_date(df$Date)
+    df$ForageMass_kg_ha <- (df$AvgPlateMeterReading * 140) + 500
     gdd <- gdd_data()
     req(gdd)
-
-    df <- merge(df, gdd[, c("Date", "GDD_cum")],
-                by = "Date", all.x = TRUE)
-
+    df <- merge(df, gdd[, c("Date","GDD_cum")], by = "Date", all.x = TRUE)
     df <- df[order(df$GDD_cum), ]
-
-    plot(df$GDD_cum,
-         df$ForageMass_kg_ha,
-         type = "b",
-         pch = 16,
-         col = "blue",
+    plot(df$GDD_cum, df$ForageMass_kg_ha,
+         type = "b", pch = 16, col = "blue",
          xlab = "Cumulative GDD (base 32°F)",
-         ylab = "Forage Mass (kg/ha)",
+         ylab = "Forage Mass (kg DM/ha)",
          main = "Forage Mass vs Growing Degree Days")
+    grid()
   })
+  
+  # ── Plot 3: 10-day forecast ──────────────────────────────────────────────
+  output$plot3 <- renderPlot({
+    req(data())
+    df                  <- data()
+    df$Date             <- parse_date(df$Date)
+    df$ForageMass_kg_ha <- (df$AvgPlateMeterReading * 140) + 500
+    gdd <- gdd_data()
+    req(gdd)
+    
+    obs <- merge(df, gdd[, c("Date","GDD_cum")], by = "Date", all.x = TRUE)
+    obs <- obs[!is.na(obs$GDD_cum) & !is.na(obs$ForageMass_kg_ha), ]
+    req(nrow(obs) >= 2)
+    
+    last_date   <- max(obs$Date)
+    future_gdd  <- gdd[gdd$Date > last_date, ]
+    
+    # Fit linear model: ForageMass ~ GDD_cum (add log transform option)
+    fit <- tryCatch(
+      lm(ForageMass_kg_ha ~ GDD_cum, data = obs),
+      error = function(e) NULL
+    )
+    req(!is.null(fit))
+    
+    all_gdd  <- c(obs$GDD_cum, future_gdd$GDD_cum)
+    pred_df  <- data.frame(GDD_cum = all_gdd)
+    pred_df$ForageMass_pred <- predict(fit, newdata = pred_df)
+    
+    n_obs   <- nrow(obs)
+    xlim    <- range(all_gdd, na.rm = TRUE)
+    ylim    <- range(c(obs$ForageMass_kg_ha, pred_df$ForageMass_pred), na.rm = TRUE)
+    
+    plot(obs$GDD_cum, obs$ForageMass_kg_ha,
+         pch = 16, col = "blue",
+         xlim = xlim, ylim = ylim,
+         xlab = "Cumulative GDD (base 32°F)",
+         ylab = "Forage Mass (kg DM/ha)",
+         main = "10-Day Forage Mass Forecast")
+    
+    # Full fitted + forecast line
+    ord <- order(pred_df$GDD_cum)
+    lines(pred_df$GDD_cum[ord], pred_df$ForageMass_pred[ord],
+          col = "gray40", lty = 2, lwd = 1.5)
+    
+    # Highlight forecast portion
+    if (nrow(future_gdd) > 0) {
+      fut_pred <- predict(fit, newdata = data.frame(GDD_cum = future_gdd$GDD_cum))
+      lines(future_gdd$GDD_cum, fut_pred, col = "red", lwd = 2)
+      points(future_gdd$GDD_cum, fut_pred, pch = 17, col = "red", cex = 0.9)
+      
+      # Annotate last forecast point
+      last_i <- which.max(future_gdd$GDD_cum)
+      text(future_gdd$GDD_cum[last_i], fut_pred[last_i],
+           labels = paste0(round(fut_pred[last_i]), " kg/ha\n",
+                           format(max(future_gdd$Date), "%b %d")),
+           pos = 3, col = "red", cex = 0.85)
+    }
+    
+    legend("topleft",
+           legend = c("Observed", "Fitted", "Forecast (+10 days)"),
+           col    = c("blue", "gray40", "red"),
+           pch    = c(16, NA, 17),
+           lty    = c(NA, 2, 1),
+           lwd    = c(NA, 1.5, 2),
+           bty    = "n")
+    grid()
+  })
+  
+  output$gdd_status <- renderText({ gdd_status() })
 }
-# Create Shiny app ----
+
 shinyApp(ui, server)
