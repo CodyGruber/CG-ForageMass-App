@@ -322,72 +322,83 @@ server <- function(input, output, session) {
     
     req(nrow(obs) >= 2)
     
-    # ---- Fit model
     fit <- lm(ForageMass_kg_ha ~ GDD_cum, data = obs)
-    a <- coef(fit)[1]
-    b <- coef(fit)[2]
+    
+    # ---- Fitted values on observed dates (for the trend line over observed period)
+    obs$Forage_fitted <- predict(fit, newdata = data.frame(GDD_cum = obs$GDD_cum))
     
     # ---- NOAA forecast
-    forecast_weather <- tryCatch({
-      get_nws_forecast()
-    }, error = function(e) NULL)
+    forecast_weather <- tryCatch(get_nws_forecast(), error = function(e) NULL)
     
     if (is.null(forecast_weather) || nrow(forecast_weather) == 0) {
       plot(obs$Date, obs$ForageMass_kg_ha,
            pch = 16, col = "blue",
            main = "NOAA Forecast Failed (Observed Only)",
-           xlab = "Date", ylab = "Forage Mass")
+           xlab = "Date", ylab = "Forage Mass (kg DM/ha)")
       return()
     }
     
-    # ---- Remove NA temps (critical fix)
     forecast_weather <- forecast_weather[
-      complete.cases(forecast_weather[, c("TMAX","TMIN")]),
-    ]
-    
+      complete.cases(forecast_weather[, c("TMAX","TMIN")]), ]
     if (nrow(forecast_weather) == 0) return()
     
-    # ---- Compute forecast GDD correctly
     forecast_weather$GDD <- pmax(
-      ((forecast_weather$TMAX + forecast_weather$TMIN)/2) - 32,
-      0
-    )
+      ((forecast_weather$TMAX + forecast_weather$TMIN) / 2) - 32, 0)
     
-    # ---- FIX: safe cumulative baseline
     last_gdd <- max(obs$GDD_cum, na.rm = TRUE)
-    if (is.infinite(last_gdd)) last_gdd <- 0
+    if (is.infinite(last_gdd) || is.na(last_gdd)) last_gdd <- 0
     
-    forecast_weather$GDD_cum <- last_gdd + cumsum(forecast_weather$GDD)
-    
-    # ---- Predict forage
+    forecast_weather$GDD_cum     <- last_gdd + cumsum(forecast_weather$GDD)
     forecast_weather$Forage_pred <- predict(fit,
-                                            newdata = data.frame(
-                                              GDD_cum = forecast_weather$GDD_cum
-                                            ))
+                                            newdata = data.frame(GDD_cum = forecast_weather$GDD_cum))
     
-    # ---- Plot
+    # ---- Build one continuous trend line: fitted over obs period + forecast
+    # Anchor point: last observed date with its MODEL-fitted value (not raw obs)
+    last_obs_row <- obs[which.max(obs$Date), ]
+    
+    trend_dates  <- c(obs$Date[order(obs$Date)],
+                      forecast_weather$Date)
+    trend_forage <- c(obs$Forage_fitted[order(obs$Date)],
+                      forecast_weather$Forage_pred)
+    
+    # ---- Axis limits
+    all_dates  <- c(obs$Date, forecast_weather$Date)
+    all_forage <- c(obs$ForageMass_kg_ha, trend_forage)
+    xlim <- range(all_dates,  na.rm = TRUE)
+    ylim <- range(all_forage, na.rm = TRUE) * c(0.95, 1.05)
+    
+    # ---- Base plot: observed raw points
     plot(obs$Date, obs$ForageMass_kg_ha,
          pch = 16, col = "blue",
+         xlim = xlim, ylim = ylim,
          xlab = "Date",
          ylab = "Forage Mass (kg DM/ha)",
          main = "10-Day Forage Forecast (NOAA NWS)")
     
-    lines(forecast_weather$Date, forecast_weather$Forage_pred,
-          col = "red", lwd = 2)
+    # ---- Single continuous line: solid over observed period, dashed for forecast
+    last_obs_date <- max(obs$Date)
+    obs_trend_idx      <- trend_dates <= last_obs_date
+    forecast_trend_idx <- trend_dates >= last_obs_date  # overlap by 1 point = seamless join
     
+    lines(trend_dates[obs_trend_idx],      trend_forage[obs_trend_idx],
+          col = "darkgreen", lwd = 2, lty = 1)
+    lines(trend_dates[forecast_trend_idx], trend_forage[forecast_trend_idx],
+          col = "red", lwd = 2, lty = 2)
+    
+    # ---- Forecast points only
     points(forecast_weather$Date, forecast_weather$Forage_pred,
-           col = "red", pch = 17)
+           col = "red", pch = 17, cex = 0.8)
     
     legend("topleft",
-           legend = c("Observed", "Forecast"),
-           col = c("blue", "red"),
-           pch = c(16, 17),
-           lty = c(NA, 1),
-           bty = "n")
+           legend = c("Observed", "Fitted trend", "Forecast"),
+           col    = c("blue", "darkgreen", "red"),
+           pch    = c(16, NA, 17),
+           lty    = c(NA,  1,  2),
+           lwd    = c(NA,  2,  2),
+           bty    = "n")
     
     grid()
   })
-  
   output$gdd_status <- renderText({ gdd_status() })
 }
 
