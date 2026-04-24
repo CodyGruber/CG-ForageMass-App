@@ -7,9 +7,95 @@ library(tidyverse)
 
 has_mesonet_pkg <- requireNamespace("mesonet", quietly = TRUE)
 
+# ── Loading modal UI ──────────────────────────────────────────────────────────
+loading_modal <- function(msg = "Fetching weather data from Mesonet…") {
+  modalDialog(
+    title = NULL,
+    footer = NULL,
+    easyClose = FALSE,
+    fade = TRUE,
+    tags$div(
+      style = "text-align:center; padding: 20px 10px; background-color: #ffffff;",
+      tags$div(
+        class = "progress",
+        style = "height: 8px; margin-bottom: 16px; background-color: #d0eaf5;",
+        tags$div(
+          class = "progress-bar progress-bar-striped active",
+          role  = "progressbar",
+          style = "width: 100%; background-color: #2a86c8;",
+          `aria-valuenow` = "100",
+          `aria-valuemin` = "0",
+          `aria-valuemax` = "100"
+        )
+      ),
+      tags$p(
+        tags$strong(msg),
+        style = "color: #1a6e3c; font-size: 15px; margin: 0;"
+      ),
+      tags$p(
+        "This may take a few seconds…",
+        style = "color: #aaa; font-size: 12px; margin-top: 6px;"
+      )
+    )
+  )
+}
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 ui <- fluidPage(
-  titlePanel("Forage Mass Tracker & GDD Calibration"),
+  tags$head(tags$style(HTML("
+    body {
+      background-color: #ffffff;
+      color: #0d2b1a;
+      font-family: Georgia, serif;
+    }
+    .well {
+      background-color: #eef7f0 !important;
+      border-color: #9fd4b2 !important;
+    }
+    h4 {
+      color: #1a6e3c;
+      font-weight: bold;
+    }
+    .btn-primary {
+      background-color: #2a86c8 !important;
+      border-color: #1a6aab !important;
+      color: #ffffff !important;
+    }
+    .btn-primary:hover {
+      background-color: #1a6aab !important;
+    }
+    .btn-danger {
+      background-color: #1a6e3c !important;
+      border-color: #145730 !important;
+      color: #ffffff !important;
+    }
+    .btn-danger:hover {
+      background-color: #145730 !important;
+    }
+    .shiny-input-container label {
+      color: #1a5c38;
+      font-weight: bold;
+    }
+    pre {
+      background-color: #eef7f0;
+      border: 1px solid #9fd4b2;
+      color: #1a5c38;
+    }
+    .modal-content {
+      border: 2px solid #2a86c8;
+      border-radius: 8px;
+    }
+    hr {
+      border-color: #9fd4b2;
+    }
+    .dataTables_wrapper {
+      color: #0d2b1a;
+    }
+  "))),
+  titlePanel(
+    tags$span("Forage Mass Tracker & GDD Calibration",
+              style = "color: #1a6e3c; font-weight: bold;")
+  ),
   
   sidebarLayout(
     sidebarPanel(
@@ -41,8 +127,8 @@ ui <- fluidPage(
       h4("Observed Data"),
       DTOutput("contents"),
       
-      h4("10-Day GDD & Forage Forecast"),       # NEW
-      DTOutput("forecast_table"),               # NEW
+      h4("10-Day GDD & Forage Forecast"),
+      DTOutput("forecast_table"),
       
       plotOutput("plot1"),
       plotOutput("plot2"),
@@ -176,7 +262,15 @@ server <- function(input, output, session) {
     
     start_date <- min(df$Date)
     end_date   <- max(df$Date) + 10
-    gdd_status("Fetching weather data from Mesonet…")
+    
+    # ── Show loading modal ──────────────────────────────────────────────────
+    src_label <- if (has_mesonet_pkg) "Mesonet package" else "IEM API"
+    showModal(loading_modal(
+      paste0("Fetching weather data via ", src_label, "…")
+    ))
+    gdd_status("Fetching weather data…")
+    on.exit(removeModal(), add = TRUE)   # always dismiss, even on error
+    # ────────────────────────────────────────────────────────────────────────
     
     weather <- if (has_mesonet_pkg) fetch_mesonet_pkg(start_date, end_date) else
       fetch_iem(start_date, end_date)
@@ -232,7 +326,7 @@ server <- function(input, output, session) {
   })
   
   # ── Forecast table ────────────────────────────────────────────────────────
-  output$forecast_table <- renderDT({             # NEW
+  output$forecast_table <- renderDT({
     fd <- forecast_data()
     req(fd)
     
@@ -248,7 +342,7 @@ server <- function(input, output, session) {
     datatable(
       display,
       rownames  = FALSE,
-      options   = list(pageLength = 10, dom = "t"),  # "t" = table only, no search box
+      options   = list(pageLength = 10, dom = "t"),
       colnames  = c("Date", "Max Temp (°F)", "Min Temp (°F)",
                     "Daily GDD", "Cumulative GDD", "Predicted Forage (kg/ha)")
     )
@@ -275,7 +369,7 @@ server <- function(input, output, session) {
     df$ForageMass_kg_ha <- (df$AvgPlateMeterReading * 140) + 500
     df                  <- df[order(df$Date), ]
     plot(df$Date, df$ForageMass_kg_ha,
-         type = "b", pch = 16, col = "darkgreen", lwd = 2,
+         type = "b", pch = 16, col = "#2a86c8", lwd = 2,
          xlab = "Date", ylab = "Forage Mass (kg DM/ha)",
          main = "Forage Mass Over Time")
     grid()
@@ -292,9 +386,9 @@ server <- function(input, output, session) {
     df <- merge(df, gdd[, c("Date","GDD_cum")], by = "Date", all.x = TRUE)
     df <- df[order(df$GDD_cum), ]
     plot(df$GDD_cum, df$ForageMass_kg_ha,
-         type = "b", pch = 16, col = "blue",
+         type = "b", pch = 16, col = "#1a6e3c",
          xlab = "Cumulative GDD (base 32°F)", ylab = "Forage Mass (kg DM/ha)",
-         main = "Forage Mass vs Growing Degree Days")
+         main = "Calibration Plot - Forage Mass vs Growing Degree Days")
     grid()
   })
   
@@ -315,7 +409,7 @@ server <- function(input, output, session) {
     fit               <- lm(ForageMass_kg_ha ~ GDD_cum, data = obs)
     obs$Forage_fitted <- predict(fit, newdata = data.frame(GDD_cum = obs$GDD_cum))
     
-    fd <- forecast_data()        # reuse the shared reactive — no duplicated fetch
+    fd <- forecast_data()
     req(fd)
     
     trend_dates  <- c(obs$Date[order(obs$Date)],        fd$Date)
@@ -327,7 +421,7 @@ server <- function(input, output, session) {
     ylim <- range(all_forage, na.rm = TRUE) * c(0.95, 1.05)
     
     plot(obs$Date, obs$ForageMass_kg_ha,
-         pch = 16, col = "blue", xlim = xlim, ylim = ylim,
+         pch = 16, col = "#2a86c8", xlim = xlim, ylim = ylim,
          xlab = "Date", ylab = "Forage Mass (kg DM/ha)",
          main = "10-Day Forage Forecast (NOAA NWS)")
     
@@ -336,14 +430,14 @@ server <- function(input, output, session) {
     fcast_idx          <- trend_dates >= last_obs_date
     
     lines(trend_dates[obs_idx],   trend_forage[obs_idx],
-          col = "darkgreen", lwd = 2, lty = 1)
+          col = "#1a6e3c", lwd = 2, lty = 1)
     lines(trend_dates[fcast_idx], trend_forage[fcast_idx],
-          col = "red", lwd = 2, lty = 2)
-    points(fd$Date, fd$Forage_pred, col = "red", pch = 17, cex = 0.8)
+          col = "#145aab", lwd = 2, lty = 2)
+    points(fd$Date, fd$Forage_pred, col = "#145aab", pch = 17, cex = 0.8)
     
     legend("topleft",
            legend = c("Observed", "Fitted trend", "Forecast"),
-           col    = c("blue", "darkgreen", "red"),
+           col    = c("#2a86c8", "#1a6e3c", "#145aab"),
            pch    = c(16, NA, 17),
            lty    = c(NA, 1, 2),
            lwd    = c(NA, 2, 2),
