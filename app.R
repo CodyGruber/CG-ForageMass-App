@@ -1,5 +1,4 @@
 library(shiny)
-if (!require(shinyjs)) install.packages("shinyjs")
 library(shinyjs)
 library(httr)
 library(jsonlite)
