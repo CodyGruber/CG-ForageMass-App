@@ -40,6 +40,30 @@ loading_modal <- function(msg = "Fetching weather data from Mesonet…") {
   )
 }
 
+# ── Plot description text (edit these to change what appears above each plot) ──
+PLOT1_DESC <- "This chart shows forage mass over time based on plate meter readings. Each point represents a field measurement converted to kg DM/ha using the formula: (reading × 140) + 500."
+
+PLOT2_DESC <- "This calibration plot relates cumulative growing degree days (GDD, base 32°F) to observed forage mass. The relationship is used to fit a linear model that drives the 10-day forecast."
+
+PLOT3_DESC <- "This forecast combines the observed trend (fitted via GDD) with NOAA NWS 10-day temperature data to project forage mass over the coming days. The dashed blue line represents predicted values beyond the last observation."
+
+plot_description_box <- function(text) {
+  tags$div(
+    style = paste(
+      "background-color: #eef7f0;",
+      "border-left: 4px solid #2a86c8;",
+      "border-radius: 4px;",
+      "padding: 10px 14px;",
+      "margin-bottom: 10px;",
+      "color: #1a5c38;",
+      "font-family: Georgia, serif;",
+      "font-size: 14px;",
+      "line-height: 1.5;"
+    ),
+    text
+  )
+}
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 ui <- fluidPage(
   tags$head(tags$style(HTML("
@@ -130,8 +154,13 @@ ui <- fluidPage(
       h4("10-Day GDD & Forage Forecast"),
       DTOutput("forecast_table"),
       
+      plot_description_box(PLOT1_DESC),
       plotOutput("plot1"),
+      
+      plot_description_box(PLOT2_DESC),
       plotOutput("plot2"),
+      
+      plot_description_box(PLOT3_DESC),
       plotOutput("plot3")
     )
   )
@@ -263,14 +292,12 @@ server <- function(input, output, session) {
     start_date <- min(df$Date)
     end_date   <- max(df$Date) + 10
     
-    # ── Show loading modal ──────────────────────────────────────────────────
     src_label <- if (has_mesonet_pkg) "Mesonet package" else "IEM API"
     showModal(loading_modal(
       paste0("Fetching weather data via ", src_label, "…")
     ))
     gdd_status("Fetching weather data…")
-    on.exit(removeModal(), add = TRUE)   # always dismiss, even on error
-    # ────────────────────────────────────────────────────────────────────────
+    on.exit(removeModal(), add = TRUE)
     
     weather <- if (has_mesonet_pkg) fetch_mesonet_pkg(start_date, end_date) else
       fetch_iem(start_date, end_date)
@@ -293,7 +320,7 @@ server <- function(input, output, session) {
     weather[, c("Date", "GDD", "GDD_cum")]
   })
   
-  # ── Forecast data (reactive so both table and plot share it) ─────────────
+  # ── Forecast data ─────────────────────────────────────────────────────────
   forecast_data <- reactive({
     req(data())
     df      <- data()
